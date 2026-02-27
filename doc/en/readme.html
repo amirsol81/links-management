@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Links Management</title>
+</head>
+<body>
+<h1>Links Management</h1>
+<p><strong>Author:</strong> Amir Soleimani<br/>
+<strong>NVDA compatibility:</strong> 2026.1 and later</p>
+<hr/>
+<h2>Overview</h2>
+<p>
+Links Management is an opt-in NVDA add-on that improves Browse Mode navigation when <strong>Screen Layout is turned off</strong>.
+</p>
+<p>
+When enabled, each link behaves as a separate line for Up/Down arrow navigation.
+Trailing punctuation is intelligently attached to the link line to prevent blank or punctuation-only lines.
+</p>
+<p>
+Inspired by JAWS, this add-on focuses on clarity, predictability, and navigation control.
+</p>
+<hr/>
+<h2>Settings</h2>
+<p>
+A dedicated settings panel is available at:
+</p>
+<p>
+NVDA menu → Preferences → Settings → Links management
+</p>
+<h3>Enable Links management</h3>
+<p>When enabled (and Screen Layout is off):</p>
+<ul>
+<li>Each link is treated as a separate navigation "line" in Browse Mode.</li>
+<li>Trailing punctuation is attached to the link line.</li>
+<li>Blank or punctuation-only lines are avoided.</li>
+</ul>
+<hr/>
+<h2>Notes</h2>
+<ul>
+<li>This add-on only affects Browse Mode behavior.</li>
+<li>It is opt-in and must be enabled in Settings.</li>
+<li>Designed for users who prefer structured link-by-link navigation.</li>
+</ul>
+<h2>Version 1.0.1 changes</h2><ul><li>Fixed an issue where certain interactive elements exposed as buttons (e.g. &lt;a role="button"&gt; on Google “Search instead for…” suggestions) could be merged into a single line when Screen layout was off.</li><li>The add-on now preserves NVDA’s original line boundaries and only applies link line-splitting when actual links exist within the current NVDA line.</li><li>Improved semantic handling to avoid interfering with elements that behave like buttons.</li></ul></body>
+</html>
