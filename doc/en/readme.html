@@ -43,5 +43,12 @@ NVDA menu → Preferences → Settings → Links management
 <li>It is opt-in and must be enabled in Settings.</li>
 <li>Designed for users who prefer structured link-by-link navigation.</li>
 </ul>
-<h2>Version 1.0.1 changes</h2><ul><li>Fixed an issue where certain interactive elements exposed as buttons (e.g. &lt;a role="button"&gt; on Google “Search instead for…” suggestions) could be merged into a single line when Screen layout was off.</li><li>The add-on now preserves NVDA’s original line boundaries and only applies link line-splitting when actual links exist within the current NVDA line.</li><li>Improved semantic handling to avoid interfering with elements that behave like buttons.</li></ul></body>
+<h2>Version 1.0.1 changes</h2><ul><li>Fixed an issue where certain interactive elements exposed as buttons (e.g. &lt;a role="button"&gt; on Google “Search instead for…” suggestions) could be merged into a single line when Screen layout was off.</li><li>The add-on now preserves NVDA’s original line boundaries and only applies link line-splitting when actual links exist within the current NVDA line.</li><li>Improved semantic handling to avoid interfering with elements that behave like buttons.</li></ul>
+<h2>Version 1.0.2 changes</h2>
+<ul>
+<li>Added support for attaching the bullet character (<code>•</code>) to the preceding link line, preventing it from being placed on a separate line in Browse Mode when Screen layout is off.</li>
+<li>This improves navigation in content where links are separated by bullets, such as author lists and inline metadata.</li>
+</ul>
+
+</body>
 </html>

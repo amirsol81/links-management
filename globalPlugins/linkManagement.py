@@ -84,7 +84,7 @@ _SEG_CACHE = weakref.WeakKeyDictionary()
 
 # Attach trailing punctuation/spaces to the link line.
 # Includes common punctuation and whitespace; also includes Unicode ellipsis (…).
-_PUNCT_RE = re.compile(r"""^[\s,.;:!?)\]\}»"\'\u2026،؛؟]+""")
+_PUNCT_RE = re.compile(r"""^[\s,.;:!?)\]\}»"\'\u2026،؛؟•]+""")
 
 
 def _isScreenLayoutOff() -> bool:
