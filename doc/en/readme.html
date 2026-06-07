@@ -86,5 +86,16 @@ traps.
 </li>
 </ul>
 
+<h2>Version 1.2.0 changes</h2>
+<ul>
+<li>Fixed cases where colons after links could appear on a separate line. For example, <code>Synonyms of temblor:</code> on Merriam-Webster is now kept on one line.</li>
+<li>Improved handling of ordinary numbered lists. In cases such as the nvda.ru VK Feed list, numbers like <code>1.</code> are now kept on the same line as the following link when this matches NVDA with Screen Layout enabled.</li>
+<li>Improved handling of ordered list items that contain a link followed by a colon and description. For example, Sintra.ai shortlist items are now presented as <code>1. Sintra AI:</code> followed by the description on the next line.</li>
+<li>Improved Wikipedia reference handling. References such as <code>[۱].</code> are now kept together instead of splitting the closing bracket and period onto a separate line.</li>
+<li>Improved handling of parenthesized links, including multi-word link text, while preserving normal Up and Down Arrow navigation.</li>
+<li>Fixed an issue where standalone right-to-left direction marks before links could appear on their own line. They are now kept with the following link, for example in expanded YouTube descriptions.</li>
+<li>Preserved previous safeguards against unwanted structural merging and cursor traps, including Down Arrow and Up Arrow navigation through repaired lines.</li>
+</ul>
+
 </body>
 </html>

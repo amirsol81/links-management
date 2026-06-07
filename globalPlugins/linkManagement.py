@@ -95,9 +95,36 @@ _PUNCT_RE = re.compile(r"""^[\s,.;:!?)\]\}»"\'\u2026،؛؟•|/·]+""")
 # (•), so symbolic markers remain supported.
 _LINK_LEADING_LIST_MARKER_RE = re.compile(r"""^\s*[•*\-–—]\s*$""")
 
+# Numbered ordered-list markers are more delicate than symbolic bullets.
+# They should not be joined in table-of-contents widgets such as the Mahroma
+# test page, but should be joined in ordinary ordered lists where Screen Layout
+# on keeps the number and the linked item title on one line, such as the
+# nvda.ru VK feed.  Only plain integer markers are considered here; hierarchical
+# TOC markers such as "1.1" are deliberately excluded.
+_ORDERED_LIST_MARKER_RE = re.compile(r"""^\s*[0-9۰-۹٠-٩]+\.\s*$""")
+
+# Directional formatting marks such as RLM (U+200F) can be exposed by
+# some pages, for example expanded YouTube descriptions, as a line of
+# their own immediately before an RTL-sensitive URL.  Treat only an
+# invisible/bidi-mark-only line that actually contains a bidi mark as a
+# prefix for the following link.  Do not treat ordinary blank lines this way.
+_BIDI_LINK_PREFIX_MARKS = "\u200e\u200f\u061c"
+
+
+def _isLinkLeadingBidiPrefix(text: str) -> bool:
+    if not text:
+        return False
+    if not any(ch in _BIDI_LINK_PREFIX_MARKS for ch in text):
+        return False
+    return not text.strip(_INVISIBLE_SPACE_CHARS + "\u061c")
+
 
 def _isLinkLeadingListMarker(text: str) -> bool:
     return bool(text and _LINK_LEADING_LIST_MARKER_RE.match(text))
+
+
+def _isOrderedListMarker(text: str) -> bool:
+    return bool(text and _ORDERED_LIST_MARKER_RE.match(text))
 
 # Opening punctuation that may belong immediately before a following link, but
 # can sometimes be exposed by NVDA as its own line. Keep this intentionally
@@ -146,12 +173,140 @@ def _findTrailingLinkLeadingOpenerStart(text: str):
 # example breadcrumbs or compact metadata lists) but should stay attached to the
 # preceding link during line navigation. Keep this intentionally narrow to avoid
 # merging real prose after links.
-_LINK_TRAILING_SEPARATOR_RE = re.compile(r"""^\s*[/·|]\s*$""")
+_LINK_TRAILING_SEPARATOR_RE = re.compile(r"""^\s*[/·|:]\s*$""")
 
 
 def _isLinkTrailingSeparator(text: str) -> bool:
     return bool(text and _LINK_TRAILING_SEPARATOR_RE.match(text))
 
+
+def _isColonTrailingSeparator(text: str) -> bool:
+    return bool(text and text.strip(_INVISIBLE_SPACE_CHARS) == ":")
+
+
+def _findLeadingColonParts(text: str):
+    """Return (colonEnd, descriptionStart) offsets inside text for ': text'.
+
+    Some pages expose a linked title as one original line and the colon plus
+    explanatory text as the following original line:
+
+        Sintra AI
+        : Best all-rounder ...
+
+    For browse-mode line navigation we want the colon to stay with the linked
+    title, while the explanation starts on its own line.  This helper detects
+    only a leading colon, with optional invisible/space characters around it.
+    """
+    if not text:
+        return None
+    i = 0
+    n = len(text)
+    while i < n and text[i] in _INVISIBLE_SPACE_CHARS:
+        i += 1
+    if i >= n or text[i] != ":":
+        return None
+    colonEnd = i + 1
+    descStart = colonEnd
+    while descStart < n and text[descStart] in _INVISIBLE_SPACE_CHARS:
+        descStart += 1
+    if descStart >= n:
+        return None
+    return colonEnd, descStart
+
+
+def _getFollowingLeadingColonLine(
+    ti: virtualBuffers.VirtualBufferTextInfo,
+    lineStart: int,
+    lineEnd: int,
+    currentEnd: int,
+    storyLen,
+):
+    """Return colon offsets for a following line that starts with ': text'."""
+    nextLine = _getNextDistinctOriginalLine(ti, lineStart, lineEnd, storyLen)
+    if not nextLine:
+        return None
+    colonStart, colonLineEnd = nextLine
+    if colonLineEnd <= colonStart:
+        return None
+    try:
+        gap = ti._getTextRange(currentEnd, colonStart)
+    except Exception:
+        gap = ""
+    if gap.strip(_INVISIBLE_SPACE_CHARS):
+        return None
+    try:
+        colonText = ti._getTextRange(colonStart, colonLineEnd)
+    except Exception:
+        return None
+    parts = _findLeadingColonParts(colonText)
+    if not parts:
+        return None
+    colonEndInText, descStartInText = parts
+    return (
+        colonStart,
+        colonStart + colonEndInText,
+        colonStart + descStartInText,
+        colonLineEnd,
+    )
+
+
+def _getFollowingSeparatorLine(
+    ti: virtualBuffers.VirtualBufferTextInfo,
+    lineStart: int,
+    lineEnd: int,
+    storyLen,
+    *,
+    colonOnly: bool = False,
+):
+    """Return the adjacent separator-only line after a line, if any.
+
+    The normal punctuation extension can only see punctuation inside the current
+    original NVDA line.  Some pages expose a separator, especially a colon after
+    a linked title, as the next original line.  This helper detects only that
+    narrow adjacent separator line.
+    """
+    nextLine = _getNextDistinctOriginalLine(ti, lineStart, lineEnd, storyLen)
+    if not nextLine:
+        return None
+    sepStart, sepEnd = nextLine
+    if sepEnd <= sepStart:
+        return None
+    try:
+        sepText = ti._getTextRange(sepStart, sepEnd)
+    except Exception:
+        return None
+    if colonOnly:
+        if not _isColonTrailingSeparator(sepText):
+            return None
+    elif not _isLinkTrailingSeparator(sepText):
+        return None
+    return sepStart, sepEnd
+
+
+def _extendEndToFollowingSeparatorLine(
+    ti: virtualBuffers.VirtualBufferTextInfo,
+    lineStart: int,
+    lineEnd: int,
+    currentEnd: int,
+    storyLen,
+    *,
+    colonOnly: bool = False,
+):
+    sepLine = _getFollowingSeparatorLine(
+        ti, lineStart, lineEnd, storyLen, colonOnly=colonOnly
+    )
+    if not sepLine:
+        return currentEnd
+    sepStart, sepEnd = sepLine
+    # Keep this adjacent-only.  If there is visible text between currentEnd and
+    # the separator line, do not glue across it.
+    try:
+        gap = ti._getTextRange(currentEnd, sepStart)
+    except Exception:
+        gap = ""
+    if gap.strip(_INVISIBLE_SPACE_CHARS):
+        return currentEnd
+    return sepEnd
 
 
 def _getNextDistinctOriginalLine(
@@ -227,11 +382,16 @@ def _getPrevDistinctOriginalLine(
 #     [۱
 #     ]
 #
+# or, when the citation is followed by a sentence period:
+#
+#     [۱
+#     ].
+#
 # Keep this deliberately narrow: an opening bracket plus only digits on the
-# link line, followed by a closing-bracket-only line. Supports Latin, Persian,
-# and Arabic-Indic digits.
+# link line, followed by a closing bracket line with an optional ASCII period.
+# Supports Latin, Persian, and Arabic-Indic digits.
 _CITATION_OPEN_RE = re.compile(r"""^\s*\[\s*[0-9۰-۹٠-٩]+\s*$""")
-_CITATION_CLOSE_RE = re.compile(r"""^\s*\]\s*$""")
+_CITATION_CLOSE_RE = re.compile(r"""^\s*\]\s*(?:\.\s*)?$""")
 
 
 def _isCitationOpeningText(text: str) -> bool:
@@ -321,17 +481,18 @@ def _extendEndToIncludeTrailingPunctuation(
     return min(limit, end + m.end())
 
 
-def _getLinkRangesInRange(
+def _getLinkControlsInRange(
     ti: virtualBuffers.VirtualBufferTextInfo, rngStart: int, rngEnd: int
 ):
-    """Return real link ranges inside [rngStart, rngEnd]."""
+    """Return (start, end, attrs) for real link controls inside a range."""
     try:
         rngTI = ti.obj.makeTextInfo(textInfos.offsets.Offsets(rngStart, rngEnd))
         fields = rngTI.getTextWithFields()
     except Exception:
         return []
 
-    linkRanges = []
+    linkControls = []
+    seen = set()
     for cmd in fields:
         if not (
             isinstance(cmd, textInfos.FieldCommand) and cmd.command == "controlStart"
@@ -352,10 +513,19 @@ def _getLinkRangesInRange(
             continue
         s = max(s, rngStart)
         e = min(e, rngEnd)
-        if e > s:
-            linkRanges.append((s, e))
+        key = (s, e)
+        if e > s and key not in seen:
+            seen.add(key)
+            linkControls.append((s, e, attrs))
 
-    return sorted(set(linkRanges))
+    return sorted(linkControls, key=lambda item: (item[0], item[1]))
+
+
+def _getLinkRangesInRange(
+    ti: virtualBuffers.VirtualBufferTextInfo, rngStart: int, rngEnd: int
+):
+    """Return real link ranges inside [rngStart, rngEnd]."""
+    return [(s, e) for (s, e, attrs) in _getLinkControlsInRange(ti, rngStart, rngEnd)]
 
 
 def _computeSegmentsForParagraph(
@@ -422,25 +592,41 @@ _INVISIBLE_SPACE_CHARS = " \t\r\n\u00a0\u200b\u200c\u200d\ufeff\u2060\u200e\u200
 _PAREN_FOLLOWING_TOKEN_RE = re.compile(
     r"""^[\s\u00a0\u200b\u200c\u200d\ufeff\u2060\u200e\u200f]*([^\s\u00a0()\[\]{}]{1,32}\))"""
 )
+_PAREN_FOLLOWING_PHRASE_RE = re.compile(
+    r"""^[\s\u00a0\u200b\u200c\u200d\ufeff\u2060\u200e\u200f]*([^()\[\]{}\r\n]{1,100}\))"""
+)
 
 
-def _findCompactParenTailEndInRawText(text: str):
+def _findParenTailEndInRawText(text: str):
     """
-    Return the character index just after a compact token following an opener.
+    Return the character index just after text that closes a preceding '('.
 
-    This intentionally accepts only a no-space token ending in ')' after optional
-    whitespace/invisible characters, e.g. BA) or JD).  It is used only when the
-    current original NVDA line is just '(', so it cannot glue arbitrary prose.
+    This is used only from a standalone opener-only line/segment, so it remains
+    forward-only.  Prefer compact tokens such as BA) / JD), but also accept a
+    short linked phrase containing spaces, such as Persian Wikipedia's
+    "انتفاضه اقصی)".
     """
     if not text:
         return None
+
     m = _PAREN_FOLLOWING_TOKEN_RE.match(text)
+    if m:
+        token = m.group(1)
+        if _tokenLooksSafeAfterOpenParen(token):
+            return m.end(1)
+
+    m = _PAREN_FOLLOWING_PHRASE_RE.match(text)
     if not m:
         return None
-    token = m.group(1)
-    if not _tokenLooksSafeAfterOpenParen(token):
+    phrase = m.group(1)
+    if not _parenTailLooksSafeAfterOpenParen(phrase):
         return None
     return m.end(1)
+
+
+def _findCompactParenTailEndInRawText(text: str):
+    """Compatibility wrapper for older call sites."""
+    return _findParenTailEndInRawText(text)
 
 
 def _maybeExtendOpenerSegmentToCompactTail(
@@ -470,7 +656,8 @@ def _maybeExtendOpenerSegmentToCompactTail(
     tailEndInText = _findCompactParenTailEndInRawText(followingText)
     if tailEndInText is None:
         return None
-    return start, end + tailEndInText
+    repairedEnd = end + tailEndInText
+    return start, _extendEndPastInvisibleWhitespace(ti, repairedEnd, storyLen)
 
 
 def _tokenLooksSafeAfterOpenParen(token: str) -> bool:
@@ -485,8 +672,54 @@ def _tokenLooksSafeAfterOpenParen(token: str) -> bool:
     return any(ch.isalnum() for ch in body)
 
 
+def _parenTailLooksSafeAfterOpenParen(text: str) -> bool:
+    """Return True for a short linked phrase that closes a preceding '('.
+
+    The original Wikipedia fix only accepted compact tokens like BA) and JD).
+    Some ordinary prose links are longer and may contain spaces, for example
+    Persian Wikipedia's "انتفاضه اقصی)".  This broader check is still narrow:
+    it is only used after a standalone opening parenthesis and requires the
+    following segment/link text to end with ')'.
+    """
+    compact = _stripInvisibleText(text)
+    if not compact or not compact.endswith(")"):
+        return False
+    body = compact[:-1].strip(_INVISIBLE_SPACE_CHARS)
+    if not body or len(body) > 100:
+        return False
+    if "(" in body or ")" in body:
+        return False
+    return any(ch.isalnum() for ch in body)
+
+
 def _stripInvisibleText(text: str) -> str:
     return text.strip(_INVISIBLE_SPACE_CHARS)
+
+
+def _extendEndPastInvisibleWhitespace(
+    ti: virtualBuffers.VirtualBufferTextInfo, end: int, storyLen, maxChars: int = 16
+) -> int:
+    """Consume only whitespace/invisible chars after a repaired range.
+
+    Forward-only opener repairs such as "(" + "انتفاضه اقصی)" must not stop
+    exactly before an inter-word space.  If they do, the next Down Arrow can
+    land on that whitespace and expose the same visual line again.  This helper
+    consumes only invisible/space characters, never the following visible text.
+    """
+    if storyLen is not None:
+        limit = min(storyLen, end + maxChars)
+    else:
+        limit = end + maxChars
+    pos = end
+    while pos < limit:
+        try:
+            ch = ti._getTextRange(pos, pos + 1)
+        except Exception:
+            break
+        if not ch or ch not in _INVISIBLE_SPACE_CHARS:
+            break
+        pos += 1
+    return pos
 
 
 def _findFinalOpenParenOffsetInSegment(
@@ -526,7 +759,7 @@ def _findFinalOpenParenOffsetInSegment(
 def _segmentLooksLikeCompactParenTail(
     ti: virtualBuffers.VirtualBufferTextInfo, start: int, end: int
 ) -> bool:
-    """Return True for compact following segments such as BA) or JD)."""
+    """Return True for following segments such as BA), JD), or linked phrases."""
     if end <= start:
         return False
     try:
@@ -534,9 +767,11 @@ def _segmentLooksLikeCompactParenTail(
     except Exception:
         return False
     compact = _stripInvisibleText(text)
-    if not compact or any(ch.isspace() for ch in compact):
+    if not compact:
         return False
-    return _tokenLooksSafeAfterOpenParen(compact)
+    if not any(ch.isspace() for ch in compact) and _tokenLooksSafeAfterOpenParen(compact):
+        return True
+    return _parenTailLooksSafeAfterOpenParen(compact)
 
 
 def _mergeOpenParenBeforeCompactLinkSegments(
@@ -629,7 +864,8 @@ def _maybeMergeAdjacentLeadingOpenerAndLink(
         followingText = ""
     tailEndInText = _findCompactParenTailEndInRawText(followingText)
     if tailEndInText is not None:
-        return baseStart, baseEnd + tailEndInText
+        repairedEnd = baseEnd + tailEndInText
+        return baseStart, _extendEndPastInvisibleWhitespace(ti, repairedEnd, storyLen)
 
     # Secondary path: ask NVDA's original line logic for the next distinct line
     # and join only a compact parenthesis-closing token or a real first link.
@@ -654,21 +890,268 @@ def _maybeMergeAdjacentLeadingOpenerAndLink(
             gap = ""
         if not gap.strip(_INVISIBLE_SPACE_CHARS):
             linkEnd = _extendEndToIncludeTrailingPunctuation(ti, firstEnd, nextEnd)
-            # Only accept compact tails like BA) / JD), not arbitrary link text.
+            # Accept compact tails like BA) / JD) and short linked phrases
+            # that close the opener, such as Persian Wikipedia's
+            # "انتفاضه اقصی)".  This remains forward-only and requires a
+            # real link immediately after the opener.
             try:
                 candidateText = ti._getTextRange(firstStart, linkEnd)
             except Exception:
                 candidateText = ""
-            if _segmentLooksLikeCompactParenTail(ti, firstStart, linkEnd) or _tokenLooksSafeAfterOpenParen(
-                candidateText.strip(_INVISIBLE_SPACE_CHARS)
+            if _segmentLooksLikeCompactParenTail(ti, firstStart, linkEnd) or _parenTailLooksSafeAfterOpenParen(
+                candidateText
             ):
-                return baseStart, linkEnd
+                return baseStart, _extendEndPastInvisibleWhitespace(ti, linkEnd, storyLen)
 
     compact = nextText.strip(_INVISIBLE_SPACE_CHARS)
     if _tokenLooksSafeAfterOpenParen(compact) and not any(ch.isspace() for ch in compact):
-        return baseStart, nextEnd
+        return baseStart, _extendEndPastInvisibleWhitespace(ti, nextEnd, storyLen)
 
     return None
+
+
+def _maybeMergeParenTailWithPreviousLeadingOpener(
+    ti: virtualBuffers.VirtualBufferTextInfo,
+    baseStart: int,
+    baseEnd: int,
+    storyLen,
+    offset: int,
+):
+    """Return the same merged range when the current line is the tail of a previous '('.
+
+    The forward opener repair makes Down Arrow move from a standalone '(' to
+    after the closing parenthesized link.  Up Arrow can still create an extra
+    stop if NVDA asks for the original tail line itself, e.g.
+
+        انتفاضه اقصی)
+
+    This very narrow mirror applies when the immediately previous original
+    line is either just '(' or ends with a final standalone '(', and the current
+    line/link safely closes it.  The returned range starts at that final opener
+    and uses an end after the closing ')' plus only following whitespace, so it
+    does not recreate the old cursor trap caused by incomplete backward ranges.
+    """
+    prevLine = _getPrevDistinctOriginalLine(ti, baseStart, baseEnd)
+    if not prevLine:
+        return None
+    prevStart, prevEnd = prevLine
+    try:
+        prevText = ti._getTextRange(prevStart, prevEnd)
+    except Exception:
+        prevText = ""
+
+    # The displayed opener segment may be just "(", but the original NVDA
+    # line before a linked parenthetical phrase can also contain ordinary
+    # prose ending with "(".  In that case, start the merged range at only
+    # the final opener, leaving the prose before it as its own line.
+    if _isLinkLeadingOpener(prevText):
+        openerStart = prevStart
+    else:
+        openerIndex = _findTrailingLinkLeadingOpenerStart(prevText)
+        if openerIndex is None:
+            return None
+        openerStart = prevStart + openerIndex
+
+    try:
+        gap = ti._getTextRange(prevEnd, baseStart)
+    except Exception:
+        gap = ""
+    if gap.strip(_INVISIBLE_SPACE_CHARS):
+        return None
+
+    # Prefer a real link at the start of the tail line, with trailing ')'
+    # included by the normal punctuation extension.
+    linkRanges = _getLinkRangesInRange(ti, baseStart, baseEnd)
+    if linkRanges:
+        firstStart, firstEnd = linkRanges[0]
+        try:
+            leadingGap = ti._getTextRange(baseStart, firstStart)
+        except Exception:
+            leadingGap = ""
+        if not leadingGap.strip(_INVISIBLE_SPACE_CHARS):
+            linkEnd = _extendEndToIncludeTrailingPunctuation(ti, firstEnd, baseEnd)
+            try:
+                candidateText = ti._getTextRange(firstStart, linkEnd)
+            except Exception:
+                candidateText = ""
+            if _parenTailLooksSafeAfterOpenParen(candidateText):
+                extendedEnd = _extendEndPastInvisibleWhitespace(ti, linkEnd, storyLen)
+                # Only map offsets that are actually inside the parenthesized
+                # tail (or its trailing invisible spacing) back to the combined
+                # opener+link range.  Without this guard, offsets in ordinary
+                # prose after the closing parenthesis can still return the
+                # previous combined range, which makes Down Arrow get stuck on
+                # the parenthesized link.
+                if firstStart <= offset < extendedEnd:
+                    return openerStart, extendedEnd
+                return None
+
+    # Fallback for buffers where the link field is not visible in this small
+    # range but the original line text itself is a safe parenthesis tail.
+    try:
+        baseText = ti._getTextRange(baseStart, baseEnd)
+    except Exception:
+        baseText = ""
+    if _parenTailLooksSafeAfterOpenParen(baseText):
+        return openerStart, _extendEndPastInvisibleWhitespace(ti, baseEnd, storyLen)
+
+    return None
+
+def _fieldValueLooksLikeSamePageAnchor(value) -> bool:
+    """Best-effort detection for TOC/internal anchor links from field attrs."""
+    if value is None:
+        return False
+    try:
+        value = str(value).strip()
+    except Exception:
+        return False
+    if not value:
+        return False
+    lower = value.lower()
+    # Relative fragment-only links are the common TOC form.
+    if lower.startswith("#"):
+        return True
+    # Absolute same-page links generally still expose a fragment.  This is only
+    # a hint; callers use it to avoid joining numbered TOC markers.
+    if "#" in lower and any(part in lower for part in ("href", "url")):
+        return True
+    return False
+
+
+def _linkAttrsLookLikeSamePageAnchor(attrs) -> bool:
+    """Return True when link attrs look like a same-page TOC/hash link."""
+    try:
+        items = list(attrs.items())
+    except Exception:
+        return False
+    for key, value in items:
+        try:
+            keyText = str(key).lower()
+        except Exception:
+            keyText = ""
+        if not any(part in keyText for part in ("href", "url")):
+            continue
+        if _fieldValueLooksLikeSamePageAnchor(value):
+            return True
+        try:
+            valueText = str(value).strip().lower()
+        except Exception:
+            valueText = ""
+        if valueText.startswith("#"):
+            return True
+    return False
+
+
+def _orderedMarkerMayJoinFollowingLink(
+    ti: virtualBuffers.VirtualBufferTextInfo, lineStart: int, lineEnd: int, attrs, linkEnd: int
+) -> bool:
+    """Decide whether a numeric marker like '1.' may join the following link.
+
+    This is intentionally stricter than symbolic bullets.  It avoids the known
+    table-of-contents regression by rejecting links that expose hash/TOC-like
+    href attributes, while allowing ordinary ordered-list feed entries.  As a
+    fallback for buffers that do not expose href attrs, allow the join only when
+    there is non-link text after the first link in the same original line (as on
+    nvda.ru, where items continue with update metadata).
+    """
+    if _linkAttrsLookLikeSamePageAnchor(attrs):
+        return False
+    try:
+        afterLinkText = ti._getTextRange(linkEnd, lineEnd)
+    except Exception:
+        afterLinkText = ""
+    if afterLinkText.strip(_INVISIBLE_SPACE_CHARS):
+        return True
+
+    # If href/url-like attrs exist and do not look like a same-page anchor, this
+    # is probably a normal destination link rather than a TOC jump.
+    try:
+        for key, value in attrs.items():
+            keyText = str(key).lower()
+            if any(part in keyText for part in ("href", "url")) and str(value).strip():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _maybeMergeAdjacentBidiPrefixAndLink(
+    ti: virtualBuffers.VirtualBufferTextInfo,
+    baseStart: int,
+    baseEnd: int,
+    storyLen,
+    offset: int,
+):
+    """Join a bidi formatting mark line, such as RLM, to the following link.
+
+    Some expanded YouTube descriptions expose an RTL mark as its own browse
+    mode line immediately before a URL:
+
+        ‏
+        https://t.me/...
+
+    The mark is meaningful for reading direction and should travel with the
+    URL, but ordinary blank lines must remain untouched.  This helper is
+    deliberately separate from the symbolic bullet/list-marker logic so that
+    only invisible bidi-mark-only lines are affected.
+    """
+    try:
+        baseText = ti._getTextRange(baseStart, baseEnd)
+    except Exception:
+        baseText = ""
+
+    # Case 1: current original line is only a bidi mark / invisible prefix.
+    # Join it forward to the first real link on the next distinct original line.
+    if _isLinkLeadingBidiPrefix(baseText):
+        if storyLen is not None and baseEnd >= storyLen:
+            return None
+        nextLine = _getNextDistinctOriginalLine(ti, baseStart, baseEnd, storyLen)
+        if not nextLine:
+            return None
+        nextStart, nextEnd = nextLine
+        linkRanges = _getLinkRangesInRange(ti, nextStart, nextEnd)
+        if not linkRanges:
+            return None
+        firstStart, firstEnd = linkRanges[0]
+        try:
+            gap = ti._getTextRange(nextStart, firstStart)
+        except Exception:
+            gap = ""
+        if gap.strip(_INVISIBLE_SPACE_CHARS + "\u061c"):
+            return None
+        linkEnd = _extendEndToIncludeTrailingPunctuation(ti, firstEnd, nextEnd)
+        return baseStart, linkEnd
+
+    # Case 2: current original line is the following link.  While the caret is
+    # inside that first link, expose the same combined prefix+link range so Up
+    # and Down navigation do not stop once on the mark and again on the URL.
+    if baseStart <= 0:
+        return None
+    linkRanges = _getLinkRangesInRange(ti, baseStart, baseEnd)
+    if not linkRanges:
+        return None
+    firstStart, firstEnd = linkRanges[0]
+    firstEnd = _extendEndToIncludeTrailingPunctuation(ti, firstEnd, baseEnd)
+    if not (firstStart <= offset < firstEnd):
+        return None
+    prevLine = _getPrevDistinctOriginalLine(ti, baseStart, baseEnd)
+    if not prevLine:
+        return None
+    prevStart, prevEnd = prevLine
+    try:
+        prevText = ti._getTextRange(prevStart, prevEnd)
+    except Exception:
+        prevText = ""
+    if not _isLinkLeadingBidiPrefix(prevText):
+        return None
+    try:
+        gap = ti._getTextRange(prevEnd, baseStart)
+    except Exception:
+        gap = ""
+    if gap.strip(_INVISIBLE_SPACE_CHARS + "\u061c"):
+        return None
+    return prevStart, firstEnd
+
 
 def _maybeMergeAdjacentListMarkerAndLink(
     ti: virtualBuffers.VirtualBufferTextInfo,
@@ -740,6 +1223,184 @@ def _maybeMergeAdjacentListMarkerAndLink(
     return None
 
 
+def _maybeMergeAdjacentOrderedListMarkerAndLink(
+    ti: virtualBuffers.VirtualBufferTextInfo,
+    baseStart: int,
+    baseEnd: int,
+    storyLen,
+    offset: int,
+):
+    """Join plain numeric ordered-list markers to normal linked list items.
+
+    Example target from nvda.ru VK feed when Screen Layout is off:
+
+        1.
+        Синтезаторы речи Vocalizer Expressive2 для Nvda
+
+    should become:
+
+        1. Синтезаторы речи Vocalizer Expressive2 для Nvda
+
+    This deliberately excludes hierarchical markers such as "1.1" and rejects
+    same-page/hash links where possible, so table-of-contents pages such as the
+    Mahroma regression target remain separate.
+    """
+    try:
+        baseText = ti._getTextRange(baseStart, baseEnd)
+    except Exception:
+        baseText = ""
+
+    # Case 1: the current original line is only a plain ordered-list marker.
+    if _isOrderedListMarker(baseText):
+        if storyLen is not None and baseEnd >= storyLen:
+            return None
+        nextLine = _getNextDistinctOriginalLine(ti, baseStart, baseEnd, storyLen)
+        if not nextLine:
+            return None
+        nextStart, nextEnd = nextLine
+        controls = _getLinkControlsInRange(ti, nextStart, nextEnd)
+        if not controls:
+            return None
+        firstStart, firstEnd, attrs = controls[0]
+        linkEnd = _extendEndToIncludeTrailingPunctuation(ti, firstEnd, nextEnd)
+        colonEnd = _extendEndToFollowingSeparatorLine(
+            ti, nextStart, nextEnd, linkEnd, storyLen, colonOnly=True
+        )
+        leadingColonLine = _getFollowingLeadingColonLine(
+            ti, nextStart, nextEnd, linkEnd, storyLen
+        )
+        # For a following line like ": description", include the colon and
+        # the following whitespace in the joined title line.  Ending at the
+        # description start is important for Browse Mode navigation: if the
+        # returned line ends immediately after the colon, the next Down Arrow
+        # can land in the whitespace before the description and map back to the
+        # same joined title line, creating a cursor trap.
+        leadingColonEnd = leadingColonLine[2] if leadingColonLine else linkEnd
+        hasFollowingColon = colonEnd > linkEnd or leadingColonEnd > linkEnd
+        if hasFollowingColon or _orderedMarkerMayJoinFollowingLink(
+            ti, nextStart, nextEnd, attrs, linkEnd
+        ):
+            return baseStart, max(colonEnd, leadingColonEnd) if hasFollowingColon else linkEnd
+        return None
+
+    # Case 2: current line contains the first link and the previous original
+    # line is the numeric marker.  Return the same combined range while the
+    # caret is inside that first link, so the line remains stable.
+    if baseStart <= 0:
+        return None
+    controls = _getLinkControlsInRange(ti, baseStart, baseEnd)
+    if not controls:
+        return None
+    firstStart, firstEnd, attrs = controls[0]
+    firstEnd = _extendEndToIncludeTrailingPunctuation(ti, firstEnd, baseEnd)
+    firstEndWithColon = _extendEndToFollowingSeparatorLine(
+        ti, baseStart, baseEnd, firstEnd, storyLen, colonOnly=True
+    )
+    leadingColonLine = _getFollowingLeadingColonLine(
+        ti, baseStart, baseEnd, firstEnd, storyLen
+    )
+    if leadingColonLine:
+        # Include the colon and any immediate spacing, but not the description
+        # text.  This makes the next navigable line start at the description
+        # itself, avoiding the Down Arrow trap at the colon/space boundary.
+        firstEndWithColon = max(firstEndWithColon, leadingColonLine[2])
+    if not (firstStart <= offset < firstEndWithColon):
+        return None
+    prevLine = _getPrevDistinctOriginalLine(ti, baseStart, baseEnd)
+    if not prevLine:
+        return None
+    prevStart, prevEnd = prevLine
+    try:
+        prevText = ti._getTextRange(prevStart, prevEnd)
+    except Exception:
+        prevText = ""
+    if not _isOrderedListMarker(prevText):
+        return None
+    hasFollowingColon = firstEndWithColon > firstEnd
+    if hasFollowingColon or _orderedMarkerMayJoinFollowingLink(
+        ti, baseStart, baseEnd, attrs, firstEnd
+    ):
+        return prevStart, firstEndWithColon if hasFollowingColon else firstEnd
+    return None
+
+
+
+def _maybeHandleLeadingColonDescriptionAfterLink(
+    ti: virtualBuffers.VirtualBufferTextInfo,
+    baseStart: int,
+    baseEnd: int,
+    storyLen,
+    offset: int,
+):
+    """Split a leading-colon description line after a link.
+
+    Target pattern:
+
+        1.
+        Sintra AI
+        : Best all-rounder ...
+
+    should expose:
+
+        1. Sintra AI:
+        Best all-rounder ...
+
+    This helper is deliberately tied to a previous real link.  It does not
+    weaken the general colon safeguard for label/heading lines such as
+    "ChatGPT said:".
+    """
+    try:
+        baseText = ti._getTextRange(baseStart, baseEnd)
+    except Exception:
+        baseText = ""
+    parts = _findLeadingColonParts(baseText)
+    if not parts:
+        return None
+    colonEndInText, descStartInText = parts
+    colonEnd = baseStart + colonEndInText
+    descStart = baseStart + descStartInText
+
+    # When the caret has progressed past the leading colon/spacing, expose the
+    # explanation without the colon.  This keeps Down Arrow moving forward.
+    if offset >= descStart:
+        return descStart, baseEnd
+
+    prevLine = _getPrevDistinctOriginalLine(ti, baseStart, baseEnd)
+    if not prevLine:
+        return None
+    prevStart, prevEnd = prevLine
+    prevControls = _getLinkControlsInRange(ti, prevStart, prevEnd)
+    if not prevControls:
+        return None
+    prevLinkStart, prevLinkEnd, prevAttrs = prevControls[0]
+    prevLinkEnd = _extendEndToIncludeTrailingPunctuation(ti, prevLinkEnd, prevEnd)
+    try:
+        gap = ti._getTextRange(prevLinkEnd, baseStart)
+    except Exception:
+        gap = ""
+    if gap.strip(_INVISIBLE_SPACE_CHARS):
+        return None
+
+    start = prevLinkStart
+    markerLine = _getPrevDistinctOriginalLine(ti, prevStart, prevEnd)
+    if markerLine:
+        markerStart, markerEnd = markerLine
+        try:
+            markerText = ti._getTextRange(markerStart, markerEnd)
+        except Exception:
+            markerText = ""
+        if _isOrderedListMarker(markerText):
+            # A leading colon after the link is enough evidence for this
+            # number + link + colon pattern.  Mahroma-style TOC entries do not
+            # have this following colon description line and remain excluded.
+            start = markerStart
+
+    # Return through descStart rather than immediately after the colon.  This
+    # keeps the visual/spoken result as "link:" while ensuring that the next
+    # Down Arrow starts at the description text, not in the whitespace after
+    # the colon, which would otherwise map back to this same range.
+    return start, descStart
+
 
 def _maybeMergeAdjacentLinkAndTrailingSeparator(
     ti: virtualBuffers.VirtualBufferTextInfo,
@@ -764,10 +1425,13 @@ def _maybeMergeAdjacentLinkAndTrailingSeparator(
         |
         اخبار روز
 
+        Synonyms of temblor
+        :
+
     The regular in-line punctuation extension only sees text inside the current
     original NVDA line. If the slash is a separate original line, join it to the
     preceding link line. This is deliberately limited to single-character separator
-    lines such as slash, middle dot, or vertical bar, so ordinary content after a link is not
+    lines such as slash, middle dot, vertical bar, or colon, so ordinary content after a link is not
     glued to the link.
     """
     try:
@@ -812,11 +1476,33 @@ def _maybeMergeAdjacentLinkAndTrailingSeparator(
         return None
     if prevEnd > baseStart or prevEnd <= prevStart:
         return None
-    prevLinkRanges = _getLinkRangesInRange(ti, prevStart, prevEnd)
-    if not prevLinkRanges:
+    prevControls = _getLinkControlsInRange(ti, prevStart, prevEnd)
+    if not prevControls:
         return None
-    prevLinkStart, prevLinkEnd = prevLinkRanges[0]
+    prevLinkStart, prevLinkEnd, prevAttrs = prevControls[0]
     prevLinkEnd = _extendEndToIncludeTrailingPunctuation(ti, prevLinkEnd, prevEnd)
+
+    # If this separator belongs to a numeric-list item that was already joined
+    # forward as marker + link + colon, keep the same combined range when the
+    # caret lands on the separator itself.  This is restricted to colon because
+    # it targets patterns such as:
+    #
+    #     1.
+    #     Sintra AI
+    #     :
+    #
+    # and avoids re-opening the older table-of-contents marker regression.
+    if _isColonTrailingSeparator(baseText):
+        markerLine = _getPrevDistinctOriginalLine(ti, prevStart, prevEnd)
+        if markerLine:
+            markerStart, markerEnd = markerLine
+            try:
+                markerText = ti._getTextRange(markerStart, markerEnd)
+            except Exception:
+                markerText = ""
+            if _isOrderedListMarker(markerText):
+                return markerStart, baseEnd
+
     return prevLinkStart, baseEnd
 
 
@@ -835,9 +1521,16 @@ def _maybeMergeAdjacentCitationBracket(
         [۱
         ]
 
+    or sentence-final references where the closing bracket and period are
+    exposed together:
+
+        [۱
+        ].
+
     This is intentionally narrower than general punctuation repair. It only
     joins a line that consists of '[' + digits to an immediately adjacent line
-    that consists only of ']'. The opening line must contain a real link.
+    that consists of ']' with an optional ASCII period. The opening line must
+    contain a real link.
     """
     try:
         baseText = ti._getTextRange(baseStart, baseEnd)
@@ -907,11 +1600,35 @@ def _patched_getLineOffsets(self: virtualBuffers.VirtualBufferTextInfo, offset: 
     if openerLinkRange:
         return openerLinkRange
 
+    openerTailRange = _maybeMergeParenTailWithPreviousLeadingOpener(
+        self, baseStart, baseEnd, storyLen, offset
+    )
+    if openerTailRange:
+        return openerTailRange
+
+    bidiPrefixLinkRange = _maybeMergeAdjacentBidiPrefixAndLink(
+        self, baseStart, baseEnd, storyLen, offset
+    )
+    if bidiPrefixLinkRange:
+        return bidiPrefixLinkRange
+
     markerLinkRange = _maybeMergeAdjacentListMarkerAndLink(
         self, baseStart, baseEnd, storyLen, offset
     )
     if markerLinkRange:
         return markerLinkRange
+
+    orderedMarkerLinkRange = _maybeMergeAdjacentOrderedListMarkerAndLink(
+        self, baseStart, baseEnd, storyLen, offset
+    )
+    if orderedMarkerLinkRange:
+        return orderedMarkerLinkRange
+
+    leadingColonDescriptionRange = _maybeHandleLeadingColonDescriptionAfterLink(
+        self, baseStart, baseEnd, storyLen, offset
+    )
+    if leadingColonDescriptionRange:
+        return leadingColonDescriptionRange
 
     separatorLinkRange = _maybeMergeAdjacentLinkAndTrailingSeparator(
         self, baseStart, baseEnd, storyLen, offset
