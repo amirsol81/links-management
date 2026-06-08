@@ -1449,6 +1449,23 @@ def _maybeMergeAdjacentLinkAndTrailingSeparator(
         )
         # Only alter navigation while the caret is inside the first link segment.
         if currentLinkStart <= offset < currentLinkEnd:
+            # Some dictionary entries expose a linked pronunciation followed by
+            # a definition line that starts with a colon, for example:
+            #
+            #     jī-ˈnē-sik, ji-ˈnes-ik
+            #     : of, relating to ...
+            #
+            # The visual result should be "link:", but the internal returned
+            # range must consume the colon and following spacing.  Otherwise the
+            # next Down Arrow can land on the colon/space and map back to the
+            # same link line forever.  This is the non-ordered-list counterpart
+            # of the Sintra shortlist fix.
+            leadingColonLine = _getFollowingLeadingColonLine(
+                ti, baseStart, baseEnd, currentLinkEnd, storyLen
+            )
+            if leadingColonLine:
+                return currentLinkStart, leadingColonLine[2]
+
             try:
                 nextStart, nextEnd = _ORIG_getLineOffsets(ti, baseEnd)
             except Exception:
