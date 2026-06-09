@@ -169,6 +169,50 @@ def _findTrailingLinkLeadingOpenerStart(text: str):
         return None
     return i
 
+# Opening square brackets can appear as non-link text immediately before
+# Wikipedia maintenance links such as:
+#
+#     [
+#     پیوند مرده]
+#
+# The closing bracket is already handled as trailing punctuation after the link.
+# Keep the opener repair separate from the parenthesis repair so the special
+# cursor-navigation logic for (BA), (JD), and Persian parenthesized links is not
+# applied to square-bracket maintenance labels.
+_LINK_LEADING_SQUARE_BRACKET_RE = re.compile(
+    r"""^[\s\u200b\u200c\u200d\ufeff\u2060\u200e\u200f]*\[[\s\u200b\u200c\u200d\ufeff\u2060\u200e\u200f]*$"""
+)
+
+
+def _isLinkLeadingSquareBracket(text: str) -> bool:
+    return bool(text and _LINK_LEADING_SQUARE_BRACKET_RE.match(text))
+
+
+def _findTrailingLinkLeadingSquareBracketStart(text: str):
+    """Return the index of a final standalone '[' before a following link."""
+    if not text:
+        return None
+    i = len(text) - 1
+    while i >= 0 and text[i] in _INVISIBLE_SPACE_CHARS:
+        i -= 1
+    if i < 0 or text[i] != "[":
+        return None
+    return i
+
+
+def _squareBracketTailLooksSafeAfterOpenBracket(text: str) -> bool:
+    """Return True for short link text that closes a preceding '['."""
+    compact = _stripInvisibleText(text)
+    if not compact or not compact.endswith("]"):
+        return False
+    body = compact[:-1].strip(_INVISIBLE_SPACE_CHARS)
+    if not body or len(body) > 100:
+        return False
+    if "[" in body or "]" in body:
+        return False
+    return any(ch.isalnum() for ch in body)
+
+
 # Single-character separators which may visually separate adjacent links (for
 # example breadcrumbs or compact metadata lists) but should stay attached to the
 # preceding link during line navigation. Keep this intentionally narrow to avoid
@@ -326,10 +370,16 @@ def _getNextDistinctOriginalLine(
     """
     if storyLen is not None and baseEnd >= storyLen:
         return None
+    # Some pages, especially dense RTL/mobile layouts, can expose a repaired
+    # link segment near the end of a much larger original line.  After Down
+    # Arrow, asking the original line logic at the exact end can keep returning
+    # the same larger line for a few character positions.  Probe farther ahead
+    # before giving up; still only accept a distinct line that starts at or
+    # after baseEnd, so this does not merge backward or across visible text.
     try:
-        limit = baseEnd + 8 if storyLen is None else min(storyLen - 1, baseEnd + 8)
+        limit = baseEnd + 256 if storyLen is None else min(storyLen - 1, baseEnd + 256)
     except Exception:
-        limit = baseEnd + 8
+        limit = baseEnd + 256
     seen = set()
     for probe in range(baseEnd, limit + 1):
         try:
@@ -552,6 +602,11 @@ def _computeSegmentsForParagraph(
     cursor = rngStart
     for s, e in linkRanges:
         linkStart = s
+        linkEnd = _extendEndToIncludeTrailingPunctuation(ti, e, rngEnd)
+        try:
+            linkTextWithTrailingPunct = ti._getTextRange(s, linkEnd)
+        except Exception:
+            linkTextWithTrailingPunct = ""
         if cursor < s:
             try:
                 preLinkText = ti._getTextRange(cursor, s)
@@ -564,6 +619,13 @@ def _computeSegmentsForParagraph(
                 # same spoken/browsed line as the link. Numbered markers such
                 # as "1." stay separate for table-of-contents lists.
                 linkStart = cursor
+            elif _isLinkLeadingSquareBracket(preLinkText) and _squareBracketTailLooksSafeAfterOpenBracket(
+                linkTextWithTrailingPunct
+            ):
+                # Wikipedia maintenance labels can expose the opening '[' as
+                # non-link text immediately before the linked label, while the
+                # closing ']' is trailing punctuation after the link.
+                linkStart = cursor
             else:
                 openerStartInText = _findTrailingLinkLeadingOpenerStart(preLinkText)
                 if openerStartInText is not None:
@@ -572,9 +634,17 @@ def _computeSegmentsForParagraph(
                         segments.append((cursor, openerStart))
                     linkStart = openerStart
                 else:
-                    segments.append((cursor, s))
+                    bracketStartInText = _findTrailingLinkLeadingSquareBracketStart(preLinkText)
+                    if bracketStartInText is not None and _squareBracketTailLooksSafeAfterOpenBracket(
+                        linkTextWithTrailingPunct
+                    ):
+                        bracketStart = cursor + bracketStartInText
+                        if bracketStart > cursor:
+                            segments.append((cursor, bracketStart))
+                        linkStart = bracketStart
+                    else:
+                        segments.append((cursor, s))
 
-        linkEnd = _extendEndToIncludeTrailingPunctuation(ti, e, rngEnd)
         segments.append((linkStart, linkEnd))
         cursor = linkEnd
 
@@ -655,6 +725,8 @@ def _maybeExtendOpenerSegmentToCompactTail(
         return None
     tailEndInText = _findCompactParenTailEndInRawText(followingText)
     if tailEndInText is None:
+        return None
+    if _isMobileContinueText(followingText[:tailEndInText]):
         return None
     repairedEnd = end + tailEndInText
     return start, _extendEndPastInvisibleWhitespace(ti, repairedEnd, storyLen)
@@ -814,6 +886,14 @@ def _mergeOpenParenBeforeCompactLinkSegments(
             if _isLinkLeadingOpener(currentText) and _segmentLooksLikeCompactParenTail(
                 ti, nextStart, nextEnd
             ):
+                try:
+                    nextText = ti._getTextRange(nextStart, nextEnd)
+                except Exception:
+                    nextText = ""
+                if _isMobileContinueText(nextText):
+                    merged.append((start, end))
+                    i += 1
+                    continue
                 merged.append((start, nextEnd))
                 i += 2
                 continue
@@ -821,6 +901,311 @@ def _mergeOpenParenBeforeCompactLinkSegments(
         i += 1
 
     return [(a, b) for (a, b) in merged if b > a]
+
+
+def _trimEndPastVisibleText(
+    ti: virtualBuffers.VirtualBufferTextInfo, start: int, end: int
+) -> int:
+    """Return the offset just after the last non-invisible character."""
+    if end <= start:
+        return end
+    try:
+        text = ti._getTextRange(start, end)
+    except Exception:
+        return end
+    i = len(text)
+    while i > 0 and text[i - 1] in _INVISIBLE_SPACE_CHARS:
+        i -= 1
+    return start + i
+
+
+def _segmentLooksLikeCompleteParenthesizedLink(
+    ti: virtualBuffers.VirtualBufferTextInfo, start: int, end: int
+) -> bool:
+    """Return True only for a whole repaired parenthesized link line.
+
+    This is intentionally stricter than looking for any trailing ``(...)``
+    fragment.  A normal link can itself end with a parenthetical suffix, for
+    example Persian Wikipedia's ``جنگ اسرائیل و لبنان ۲۰۰۶ (میلادی)``.  Treating
+    that as a repaired parenthesized-link segment can make Up Arrow map the
+    following line back to the same boundary and get stuck.  The special boundary
+    handling below should only apply to segments whose visible text is itself
+    the parenthesized link, such as ``(BA)``, ``(JD)``, ``(انتفاضه اقصی)``, or
+    mobile.ir-style ``(ادامه)``.
+    """
+    if end <= start:
+        return False
+    try:
+        text = ti._getTextRange(start, end)
+    except Exception:
+        return False
+    if not text:
+        return False
+
+    visibleText = text.strip(_INVISIBLE_SPACE_CHARS)
+    if not (visibleText.startswith("(") and visibleText.endswith(")")):
+        return False
+    if not _parenTailLooksSafeAfterOpenParen(visibleText[1:]):
+        return False
+
+    visibleStart = start + (len(text) - len(text.lstrip(_INVISIBLE_SPACE_CHARS)))
+    visibleEnd = visibleStart + len(visibleText)
+    linkRanges = _getLinkRangesInRange(ti, visibleStart, visibleEnd)
+    return bool(linkRanges)
+
+
+def _segmentLooksLikeMobileContinueParenthesizedLink(
+    ti: virtualBuffers.VirtualBufferTextInfo, start: int, end: int
+) -> bool:
+    """Return True for mobile.ir short expand/collapse links like (ادامه).
+
+    These links are exposed as a real link whose visible text is wrapped by
+    non-link parentheses.  They need the parentheses for presentation, but they
+    are also especially prone to browse-mode cursor loops when NVDA asks for a
+    position inside the repaired parenthesized segment after Down Arrow.  Keep
+    this check deliberately narrow so normal parenthesized links such as (BA),
+    (JD), and multi-word Wikipedia links continue to use the general logic.
+    """
+    if not _segmentLooksLikeCompleteParenthesizedLink(ti, start, end):
+        return False
+    try:
+        text = ti._getTextRange(start, end)
+    except Exception:
+        return False
+    visibleText = text.strip(_INVISIBLE_SPACE_CHARS)
+    if not (visibleText.startswith("(") and visibleText.endswith(")")):
+        return False
+    body = visibleText[1:-1].strip(_INVISIBLE_SPACE_CHARS)
+    return body in {"ادامه", "کمتر"}
+
+
+def _isMobileContinueText(text: str) -> bool:
+    """Return True for mobile.ir short expand/collapse link text."""
+    if not text:
+        return False
+    body = _stripInvisibleText(text).strip(_INVISIBLE_SPACE_CHARS)
+    if body.endswith(")"):
+        body = body[:-1].strip(_INVISIBLE_SPACE_CHARS)
+    if body.startswith("("):
+        body = body[1:].strip(_INVISIBLE_SPACE_CHARS)
+    return body in {"ادامه", "کمتر"}
+
+
+def _lineContainsMobileContinueParenthesizedLink(
+    ti: virtualBuffers.VirtualBufferTextInfo, baseStart: int, baseEnd: int
+) -> bool:
+    """Detect mobile.ir-style ``(ادامه)`` / ``(کمتر)`` links in a baseline line.
+
+    These entries are unusually trap-prone because the opening parenthesis is
+    non-link text at the end of a longer description while the short link body
+    follows immediately.  Splitting that tail into its own repaired segment can
+    leave NVDA with the same boundary offset for both Up and Down navigation.
+    For this narrow pattern, the safest behavior is to leave NVDA's original
+    line range untouched rather than applying the parenthesized-link repair.
+    """
+    linkRanges = _getLinkRangesInRange(ti, baseStart, baseEnd)
+    if not linkRanges:
+        return False
+    for linkStart, linkEnd in linkRanges:
+        try:
+            linkText = ti._getTextRange(linkStart, linkEnd)
+        except Exception:
+            linkText = ""
+        if not _isMobileContinueText(linkText):
+            continue
+        try:
+            beforeText = ti._getTextRange(baseStart, linkStart)
+        except Exception:
+            beforeText = ""
+        if _findTrailingLinkLeadingOpenerStart(beforeText) is None:
+            continue
+        punctEnd = _extendEndToIncludeTrailingPunctuation(ti, linkEnd, baseEnd)
+        try:
+            afterText = ti._getTextRange(linkEnd, punctEnd)
+        except Exception:
+            afterText = ""
+        visibleAfter = _stripInvisibleText(afterText).strip(_INVISIBLE_SPACE_CHARS)
+        if visibleAfter.startswith(")") or _stripInvisibleText(linkText).strip(_INVISIBLE_SPACE_CHARS).endswith(")"):
+            return True
+    return False
+
+
+def _nextRangeAfterSegment(
+    ti: virtualBuffers.VirtualBufferTextInfo,
+    baseStart: int,
+    baseEnd: int,
+    storyLen,
+    segments,
+    index: int,
+):
+    """Return the next same-line segment or the next original NVDA line."""
+    if index + 1 < len(segments):
+        return segments[index + 1]
+    return _getNextDistinctOriginalLine(ti, baseStart, baseEnd, storyLen)
+
+
+def _maybeMovePastTrailingWhitespaceAfterParenthesizedSegment(
+    ti: virtualBuffers.VirtualBufferTextInfo,
+    baseStart: int,
+    baseEnd: int,
+    storyLen,
+    offset: int,
+    segments,
+):
+    """Avoid trapping after repaired parenthesized links.
+
+    Short links displayed as (ادامه) on mobile.ir can be repaired correctly but
+    still trap when the next navigation offset lands exactly at, or just after,
+    the closing parenthesis.  Do not let that boundary fall back to the larger
+    original NVDA line, which may still contain the opener at the end of the
+    previous text and can make Home/Down Arrow appear to cycle.
+
+    This is intentionally segment-local: it only applies after the segmenter has
+    already produced a complete parenthesized link containing a real link.  If
+    there is another visible segment later in the same original line, expose
+    that segment; otherwise expose the next original NVDA line.
+    """
+    if not segments:
+        return None
+
+    for index, (segStart, segEnd) in enumerate(segments):
+        if not _segmentLooksLikeCompleteParenthesizedLink(ti, segStart, segEnd):
+            continue
+        visibleEnd = _trimEndPastVisibleText(ti, segStart, segEnd)
+        if offset < visibleEnd:
+            continue
+
+        # The offset must be at the end of this repaired segment or in only
+        # invisible spacing after it.  If visible text intervenes, this is not
+        # the parenthesized-link boundary we are trying to repair.
+        boundaryEnd = segEnd
+        if index + 1 < len(segments):
+            nextStart, nextEnd = segments[index + 1]
+            boundaryEnd = nextStart
+        else:
+            boundaryEnd = baseEnd
+        if offset > boundaryEnd:
+            continue
+        try:
+            gap = ti._getTextRange(visibleEnd, min(boundaryEnd, max(visibleEnd, offset)))
+        except Exception:
+            gap = ""
+        if gap.strip(_INVISIBLE_SPACE_CHARS):
+            continue
+
+        if index + 1 < len(segments):
+            return segments[index + 1]
+        nextLine = _getNextDistinctOriginalLine(ti, baseStart, baseEnd, storyLen)
+        if nextLine:
+            return nextLine
+    return None
+
+
+
+def _maybeMergeAdjacentLeadingSquareBracketAndLink(
+    ti: virtualBuffers.VirtualBufferTextInfo,
+    baseStart: int,
+    baseEnd: int,
+    storyLen,
+    offset: int,
+):
+    """Join a standalone '[' line to a following link that closes with ']'.
+
+    This handles Persian Wikipedia maintenance labels such as:
+
+        [
+        پیوند مرده]
+
+    The closing bracket is normally included by trailing-punctuation handling.
+    Keep this separate from the parenthesized-link repair to avoid reusing its
+    special navigation rules.
+    """
+    try:
+        baseText = ti._getTextRange(baseStart, baseEnd)
+    except Exception:
+        baseText = ""
+
+    # Case 1: the current original line is only '['. Merge it forward with the
+    # first real link on the next distinct original line if that linked text
+    # closes the bracket.
+    if _isLinkLeadingSquareBracket(baseText):
+        if storyLen is not None and baseEnd >= storyLen:
+            return None
+        nextLine = _getNextDistinctOriginalLine(ti, baseStart, baseEnd, storyLen)
+        if not nextLine:
+            return None
+        nextStart, nextEnd = nextLine
+        linkRanges = _getLinkRangesInRange(ti, nextStart, nextEnd)
+        if not linkRanges:
+            return None
+        firstStart, firstEnd = linkRanges[0]
+        try:
+            gap = ti._getTextRange(nextStart, firstStart)
+        except Exception:
+            gap = ""
+        if gap.strip(_INVISIBLE_SPACE_CHARS):
+            return None
+        linkEnd = _extendEndToIncludeTrailingPunctuation(ti, firstEnd, nextEnd)
+        try:
+            candidateText = ti._getTextRange(firstStart, linkEnd)
+        except Exception:
+            candidateText = ""
+        if not _squareBracketTailLooksSafeAfterOpenBracket(candidateText):
+            return None
+        return baseStart, _extendEndPastInvisibleWhitespace(ti, linkEnd, storyLen)
+
+    # Case 2: the current original line is the link tail and the previous line
+    # is '[' or ends with '['. Return the same combined range only while the
+    # offset is inside the linked tail, so Up Arrow gets one stable line but
+    # offsets that have moved beyond it are not mapped backward.
+    if baseStart <= 0:
+        return None
+    linkRanges = _getLinkRangesInRange(ti, baseStart, baseEnd)
+    if not linkRanges:
+        return None
+    firstStart, firstEnd = linkRanges[0]
+    try:
+        leadingGap = ti._getTextRange(baseStart, firstStart)
+    except Exception:
+        leadingGap = ""
+    if leadingGap.strip(_INVISIBLE_SPACE_CHARS):
+        return None
+    linkEnd = _extendEndToIncludeTrailingPunctuation(ti, firstEnd, baseEnd)
+    try:
+        candidateText = ti._getTextRange(firstStart, linkEnd)
+    except Exception:
+        candidateText = ""
+    if not _squareBracketTailLooksSafeAfterOpenBracket(candidateText):
+        return None
+
+    prevLine = _getPrevDistinctOriginalLine(ti, baseStart, baseEnd)
+    if not prevLine:
+        return None
+    prevStart, prevEnd = prevLine
+    try:
+        prevText = ti._getTextRange(prevStart, prevEnd)
+    except Exception:
+        prevText = ""
+
+    if _isLinkLeadingSquareBracket(prevText):
+        openerStart = prevStart
+    else:
+        bracketIndex = _findTrailingLinkLeadingSquareBracketStart(prevText)
+        if bracketIndex is None:
+            return None
+        openerStart = prevStart + bracketIndex
+
+    try:
+        gap = ti._getTextRange(prevEnd, baseStart)
+    except Exception:
+        gap = ""
+    if gap.strip(_INVISIBLE_SPACE_CHARS):
+        return None
+
+    extendedEnd = _extendEndPastInvisibleWhitespace(ti, linkEnd, storyLen)
+    if firstStart <= offset < extendedEnd:
+        return openerStart, extendedEnd
+    return None
 
 
 def _maybeMergeAdjacentLeadingOpenerAndLink(
@@ -864,6 +1249,8 @@ def _maybeMergeAdjacentLeadingOpenerAndLink(
         followingText = ""
     tailEndInText = _findCompactParenTailEndInRawText(followingText)
     if tailEndInText is not None:
+        if _isMobileContinueText(followingText[:tailEndInText]):
+            return None
         repairedEnd = baseEnd + tailEndInText
         return baseStart, _extendEndPastInvisibleWhitespace(ti, repairedEnd, storyLen)
 
@@ -901,6 +1288,8 @@ def _maybeMergeAdjacentLeadingOpenerAndLink(
             if _segmentLooksLikeCompactParenTail(ti, firstStart, linkEnd) or _parenTailLooksSafeAfterOpenParen(
                 candidateText
             ):
+                if _isMobileContinueText(candidateText):
+                    return None
                 return baseStart, _extendEndPastInvisibleWhitespace(ti, linkEnd, storyLen)
 
     compact = nextText.strip(_INVISIBLE_SPACE_CHARS)
@@ -976,6 +1365,18 @@ def _maybeMergeParenTailWithPreviousLeadingOpener(
                 candidateText = ""
             if _parenTailLooksSafeAfterOpenParen(candidateText):
                 extendedEnd = _extendEndPastInvisibleWhitespace(ti, linkEnd, storyLen)
+                # mobile.ir short expand/collapse links such as (ادامه) are
+                # especially prone to a Down Arrow loop when this backward
+                # mirror is returned for an offset inside the tail link.  Expose
+                # the combined line only from the tail's start; if NVDA asks
+                # again from inside the same short tail, move forward instead
+                # of remapping back to the opener.
+                try:
+                    tailBody = _stripInvisibleText(candidateText)[:-1].strip(_INVISIBLE_SPACE_CHARS)
+                except Exception:
+                    tailBody = ""
+                if tailBody in {"ادامه", "کمتر"}:
+                    return None
                 # Only map offsets that are actually inside the parenthesized
                 # tail (or its trailing invisible spacing) back to the combined
                 # opener+link range.  Without this guard, offsets in ordinary
@@ -988,12 +1389,23 @@ def _maybeMergeParenTailWithPreviousLeadingOpener(
 
     # Fallback for buffers where the link field is not visible in this small
     # range but the original line text itself is a safe parenthesis tail.
+    # Keep the same offset guard used above for real link fields.  Without this,
+    # an offset that has already moved past the parenthesized tail can be mapped
+    # back to the combined opener+tail range, causing Down Arrow to get stuck on
+    # short parenthesized links such as mobile.ir's "(ادامه)" entries.
     try:
         baseText = ti._getTextRange(baseStart, baseEnd)
     except Exception:
         baseText = ""
     if _parenTailLooksSafeAfterOpenParen(baseText):
-        return openerStart, _extendEndPastInvisibleWhitespace(ti, baseEnd, storyLen)
+        extendedEnd = _extendEndPastInvisibleWhitespace(ti, baseEnd, storyLen)
+        try:
+            tailBody = _stripInvisibleText(baseText)[:-1].strip(_INVISIBLE_SPACE_CHARS)
+        except Exception:
+            tailBody = ""
+        if tailBody in {"ادامه", "کمتر"}:
+            return None
+        return openerStart, extendedEnd
 
     return None
 
@@ -1611,6 +2023,21 @@ def _patched_getLineOffsets(self: virtualBuffers.VirtualBufferTextInfo, offset: 
     except Exception:
         storyLen = None
 
+    # mobile.ir exposes short expand/collapse links such as (ادامه) with
+    # non-link parentheses around a short real link.  Earlier parenthesis
+    # repairs can make these entries look right but create an unavoidable
+    # same-offset loop for both Up and Down navigation.  For this narrow
+    # pattern, prefer NVDA's original line range and skip all custom link
+    # segmentation/parenthesis repair.
+    if _lineContainsMobileContinueParenthesizedLink(self, baseStart, baseEnd):
+        return baseStart, baseEnd
+
+    bracketLinkRange = _maybeMergeAdjacentLeadingSquareBracketAndLink(
+        self, baseStart, baseEnd, storyLen, offset
+    )
+    if bracketLinkRange:
+        return bracketLinkRange
+
     openerLinkRange = _maybeMergeAdjacentLeadingOpenerAndLink(
         self, baseStart, baseEnd, storyLen, offset
     )
@@ -1674,8 +2101,30 @@ def _patched_getLineOffsets(self: virtualBuffers.VirtualBufferTextInfo, offset: 
     if not segments:
         return baseStart, baseEnd
 
-    for s, e in segments:
+    parenthesizedWhitespaceRange = _maybeMovePastTrailingWhitespaceAfterParenthesizedSegment(
+        self, baseStart, baseEnd, storyLen, offset, segments
+    )
+    if parenthesizedWhitespaceRange:
+        return parenthesizedWhitespaceRange
+
+    for index, (s, e) in enumerate(segments):
         if s <= offset < e:
+            # mobile.ir exposes short expand/collapse links such as (ادامه) as
+            # a repaired parenthesized link at the end of a larger original
+            # line.  After Down Arrow, NVDA can ask for an offset inside the
+            # repaired segment rather than exactly at its start; returning the
+            # same range again creates a cursor loop.  Let the line be exposed
+            # from its start, but if the caret is already inside the short
+            # parenthesized link, move forward to the next available line.
+            if (
+                offset > s
+                and _segmentLooksLikeMobileContinueParenthesizedLink(self, s, e)
+            ):
+                nextRange = _nextRangeAfterSegment(
+                    self, baseStart, baseEnd, storyLen, segments, index
+                )
+                if nextRange:
+                    return nextRange
             openerSegmentRange = _maybeExtendOpenerSegmentToCompactTail(
                 self, s, e, storyLen
             )
@@ -1683,9 +2132,31 @@ def _patched_getLineOffsets(self: virtualBuffers.VirtualBufferTextInfo, offset: 
                 return openerSegmentRange
             return s, e
 
-    # If offset is exactly at end, snap to last segment if present.
-    if segments and offset == baseEnd:
-        return segments[-1]
+    # If navigation lands at or just after the visible end of the final repaired
+    # parenthesized-link segment, do not snap back to that same final segment or
+    # to the larger original line that still contains the opener.  This is the
+    # mobile.ir "(ادامه)" trap: Down Arrow can repeatedly ask for an offset at
+    # the close-parenthesis boundary (or trailing invisible spacing), and the
+    # old fallback would expose the same line again.
+    if segments:
+        lastStart, lastEnd = segments[-1]
+        if _segmentLooksLikeCompleteParenthesizedLink(self, lastStart, lastEnd):
+            visibleEnd = _trimEndPastVisibleText(self, lastStart, lastEnd)
+            if offset >= visibleEnd:
+                try:
+                    gap = self._getTextRange(visibleEnd, min(baseEnd, max(visibleEnd, offset)))
+                except Exception:
+                    gap = ""
+                if not gap.strip(_INVISIBLE_SPACE_CHARS):
+                    nextLine = _getNextDistinctOriginalLine(self, baseStart, baseEnd, storyLen)
+                    if nextLine:
+                        return nextLine
+                    # As a last resort, do not return the repaired segment again.
+                    # Falling back to the original baseline is safer than creating
+                    # a tight loop on the same parenthesized link.
+                    return baseStart, baseEnd
+        if offset == baseEnd:
+            return segments[-1]
 
     return baseStart, baseEnd
 
